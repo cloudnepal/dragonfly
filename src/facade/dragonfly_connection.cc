@@ -87,7 +87,7 @@ constexpr size_t kMaxReadSize = 32_KB;
 struct PubMsgRecord {
   Connection::PubMessage pub_msg;
 
-  PubMsgRecord(const Connection::PubMessage& pmsg) : pub_msg(pmsg) {
+  PubMsgRecord(Connection::PubMessage pmsg) : pub_msg(move(pmsg)) {
   }
 };
 
@@ -149,7 +149,7 @@ class Connection::Request {
   static RequestPtr New(mi_heap_t* heap, const RespVec& args, size_t capacity);
 
   // Overload to create a new pubsub message
-  static RequestPtr New(const PubMessage& pub_msg);
+  static RequestPtr New(PubMessage pub_msg);
 
   // Overload to create a new the monitor message
   static RequestPtr New(MonitorMessage msg);
@@ -221,13 +221,13 @@ void Connection::Request::SetArgs(const RespVec& args) {
   }
 }
 
-Connection::RequestPtr Connection::Request::New(const PubMessage& pub_msg) {
+Connection::RequestPtr Connection::Request::New(PubMessage pub_msg) {
   // This will generate a new request for pubsub message
   // Please note that unlike the above case, we don't need to "protect", the internals here
   // since we are currently using a borrow token for it - i.e. the BlockingCounter will
   // ensure that the message is not deleted until we are finish sending it at the other
   // side of the queue
-  PubMsgRecord new_msg{pub_msg};
+  PubMsgRecord new_msg{move(pub_msg)};
   void* ptr = mi_malloc(sizeof(Request));
   Request* req = new (ptr) Request(std::move(new_msg));
   return Connection::RequestPtr{req, Connection::RequestDeleter{}};
@@ -275,17 +275,26 @@ void Connection::DispatchOperations::operator()(const PubMsgRecord& msg) {
   ++stats->async_writes_cnt;
   const PubMessage& pub_msg = msg.pub_msg;
   string_view arr[4];
-  if (pub_msg.pattern.empty()) {
-    arr[0] = "message";
-    arr[1] = pub_msg.channel;
-    arr[2] = *pub_msg.message;
-    rbuilder->SendStringArr(absl::Span<string_view>{arr, 3});
+  if (pub_msg.type == PubMessage::kPublish) {
+    if (pub_msg.pattern.empty()) {
+      DVLOG(1) << "Sending message, from channel: " << *pub_msg.channel << " " << *pub_msg.message;
+      arr[0] = "message";
+      arr[1] = *pub_msg.channel;
+      arr[2] = *pub_msg.message;
+      rbuilder->SendStringArr(absl::Span<string_view>{arr, 3});
+    } else {
+      arr[0] = "pmessage";
+      arr[1] = pub_msg.pattern;
+      arr[2] = *pub_msg.channel;
+      arr[3] = *pub_msg.message;
+      rbuilder->SendStringArr(absl::Span<string_view>{arr, 4});
+    }
   } else {
-    arr[0] = "pmessage";
-    arr[1] = pub_msg.pattern;
-    arr[2] = pub_msg.channel;
-    arr[3] = *pub_msg.message;
-    rbuilder->SendStringArr(absl::Span<string_view>{arr, 4});
+    const char* action[2] = {"unsubscribe", "subscribe"};
+    rbuilder->StartArray(3);
+    rbuilder->SendBulkString(action[pub_msg.type == PubMessage::kSubscribe]);
+    rbuilder->SendBulkString(*pub_msg.channel);
+    rbuilder->SendLong(pub_msg.channel_cnt);
   }
 }
 
@@ -445,13 +454,14 @@ void Connection::RegisterOnBreak(BreakerCb breaker_cb) {
   breaker_cb_ = breaker_cb;
 }
 
-void Connection::SendMsgVecAsync(const PubMessage& pub_msg) {
+void Connection::SendMsgVecAsync(PubMessage pub_msg) {
   DCHECK(cc_);
 
   if (cc_->conn_closing) {
     return;
   }
-  RequestPtr req = Request::New(pub_msg);  // new (ptr) Request(0, 0);
+
+  RequestPtr req = Request::New(move(pub_msg));
   dispatch_q_.push_back(std::move(req));
   if (dispatch_q_.size() == 1) {
     evc_.notify();

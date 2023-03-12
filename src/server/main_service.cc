@@ -998,7 +998,8 @@ void Service::Eval(CmdArgList args, ConnectionContext* cntx) {
   }
 
   if (add_result == Interpreter::ADD_OK) {
-    server_family_.script_mgr()->Insert(result, body);
+    if (auto err = server_family_.script_mgr()->Insert(result, body); err)
+      return (*cntx)->SendError(err.Format(), facade::kScriptErrType);
   }
 
   EvalArgs eval_args;
@@ -1366,9 +1367,6 @@ void Service::Exec(CmdArgList args, ConnectionContext* cntx) {
 void Service::Publish(CmdArgList args, ConnectionContext* cntx) {
   string_view channel = ArgS(args, 1);
 
-  // shared_ptr ensures that the message lives until it's been sent to all subscribers and handled
-  // by DispatchOperations.
-  std::shared_ptr<const std::string> message = std::make_shared<const std::string>(ArgS(args, 2));
   ShardId sid = Shard(channel, shard_count());
 
   auto cb = [&] { return EngineShard::tlocal()->channel_slice().FetchSubscribers(channel); };
@@ -1390,12 +1388,18 @@ void Service::Publish(CmdArgList args, ConnectionContext* cntx) {
       }
     }
 
+    // shared_ptr ensures that the message lives until it's been sent to all subscribers and handled
+    // by DispatchOperations.
+    shared_ptr<string> msg_ptr = make_shared<string>(ArgS(args, 2));
+    shared_ptr<string> channel_ptr = make_shared<string>(channel);
+    using PubMessage = facade::Connection::PubMessage;
+
     // We run publish_cb in each subscriber's thread.
     auto publish_cb = [&](unsigned idx, util::ProactorBase*) mutable {
       unsigned start = slices[idx];
 
       for (unsigned i = start; i < subscriber_arr.size(); ++i) {
-        const ChannelSlice::Subscriber& subscriber = subscriber_arr[i];
+        ChannelSlice::Subscriber& subscriber = subscriber_arr[i];
         if (subscriber.thread_id != idx)
           break;
 
@@ -1403,11 +1407,14 @@ void Service::Publish(CmdArgList args, ConnectionContext* cntx) {
 
         facade::Connection* conn = subscriber_arr[i].conn_cntx->owner();
         DCHECK(conn);
-        facade::Connection::PubMessage pmsg;
-        pmsg.channel = channel;
-        pmsg.message = message;
-        pmsg.pattern = subscriber.pattern;
-        conn->SendMsgVecAsync(pmsg);
+
+        PubMessage pmsg;
+        pmsg.channel = channel_ptr;
+        pmsg.message = msg_ptr;
+        pmsg.pattern = move(subscriber.pattern);
+        pmsg.type = PubMessage::kPublish;
+
+        conn->SendMsgVecAsync(move(pmsg));
       }
     };
 
